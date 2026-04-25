@@ -1,0 +1,180 @@
+name: CI
+on:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+
+  code_repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          repository: Ragavendira1/aidevsecopsdemo
+          ref: dev
+
+  secret_scan:
+    needs: code_repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secret Scan (Gitleaks - HARD GATE)
+        run: |
+          docker run --rm -v $(pwd):/repo zricethezav/gitleaks detect -s /repo --no-banner --exit-code 1
+
+  sast:
+    needs: secret_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SAST Scan (Semgrep - HARD GATE)
+        run: |
+          pip install semgrep
+          semgrep scan --severity error --error
+
+  dependency_install:
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+  dependency_scan:
+    needs: dependency_install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Scan (Safety - HARD GATE)
+        run: |
+          pip install safety
+          safety check --full-report --exit-code 1
+
+  lint_quality:
+    needs: dependency_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint and Quality
+        run: |
+          pip install flake8
+          flake8 .
+
+  tests:
+    needs: lint_quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Unit Tests (HARD GATE)
+        run: |
+          pip install -r requirements.txt
+          pytest --disable-warnings --maxfail=1
+
+  build:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Application
+        run: python setup.py sdist bdist_wheel
+
+  container_scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy FS Scan (HARD GATE)
+        run: |
+          docker run --rm -v $(pwd):/src aquasec/trivy fs /src --exit-code 1 --severity HIGH,CRITICAL
+
+  iac_scan:
+    needs: container_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: IaC Scan (Tfsec - HARD GATE)
+        run: docker run --rm -v $(pwd):/src aquasec/tfsec /src --soft-fail=false
+
+  sbom:
+    needs: iac_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SBOM Generation (CycloneDX)
+        run: |
+          docker run --rm -v $(pwd):/src anchore/syft packages dir:/src -o cyclonedx-json=sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  deploy_dev:
+    needs: sbom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dev Deployment
+        run: echo "Deploying to Dev"
+      - name: Health Check Dev
+        run: curl -I https://dev.myapp.com || exit 1
+
+  dast:
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    env:
+      TARGET_URL: https://dev.myapp.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: DAST Scan (OWASP ZAP - HARD GATE)
+        run: |
+          docker run --rm -v $(pwd):/zap/wrk owasp/zap2docker-stable \
+          zap-baseline.py -t $TARGET_URL -r zap-report.html --exit-code 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.html
+
+  compliance_checks:
+    needs: dast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compliance Checks Placeholder
+        run: echo "Compliance checks executed"
+
+  approval_prod:
+    needs: compliance_checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Manual Approval Required
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: ''
+
+  deploy_qa:
+    needs: approval_prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: QA Deployment
+        run: echo "Deploying to QA"
+
+  artifact:
+    needs: deploy_qa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package Artifacts
+        run: echo "Packaging artifacts"
